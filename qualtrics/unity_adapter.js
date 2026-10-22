@@ -1,47 +1,73 @@
-/* Include in the UPDATED Unity WebGL index page, not in Qualtrics.
- * Attach the real Unity instance after createUnityInstance resolves.
- * This adapter does not implement the betting task or historical playback. */
+/* Study 3 adapter: requires the matching rebuilt Unity Study3 bridge.
+ * Loaded before the Unity loader. The game registers its actual receiver.
+ * Ready means Unity accepted the assignment, not merely that SendMessage ran.
+ */
 (function () {
   "use strict";
   var allowedParentOrigins = ["https://ubc.yul1.qualtrics.com"];
-  // This adapter owns inbound messages on the dedicated production page.
-  // The inspected compiled Study3ListenForParent uses this same guard.
-  // Set it BEFORE Unity loads, preventing a second, less strict listener.
-  window.__study3ParentBound = true;
-  var engine, config, parentOrigin, target, method, appliedToken;
+  var engine, target, method, config, parentOrigin, deliveredToken;
+  var accepted = false, queued = false, completionSent = false, saved = false;
+  function send(data) { window.parent.postMessage(data, parentOrigin); }
   function apply() {
-    if (!engine || !config || appliedToken === config.sessionToken) return;
-    engine.SendMessage(target, method, JSON.stringify(config));
-    appliedToken = config.sessionToken;
-    window.parent.postMessage({type:"study3_ready",version:"1.0",sessionToken:config.sessionToken},parentOrigin);
+    if (queued || !engine || !target || !method || !config || deliveredToken) return;
+    queued = true;
+    // Avoid calling back into managed code inside Listen's C# -> JS stack.
+    Promise.resolve().then(function () {
+      queued = false;
+      if (deliveredToken || !engine || !target || !config) return;
+      deliveredToken = config.sessionToken;
+      engine.SendMessage(target, method, JSON.stringify(config));
+    });
   }
-  window.addEventListener("message",function (event) {
+  function valid(data) {
+    return data && data.type === "study3_init" && data.version === "1.0"
+      && typeof data.sessionToken === "string" && /^[a-f0-9]{32}$/.test(data.sessionToken)
+      && ["no_information","anonymous_information","named_information"].indexOf(data.condition) !== -1
+      && Number.isInteger(data.orderId) && data.orderId >= 1 && data.orderId <= 10
+      && Array.isArray(data.trialOrder) && data.trialOrder.length === 10
+      && new Set(data.trialOrder).size === 10
+      && data.trialOrder.every(function(id){return /^S3_(0[1-9]|10)$/.test(id);})
+      && data.probabilitySumRule === "sum100" && data.showOdds === true
+      && data.startingCredits === 5000 && data.bonusCapGBP === 2.5;
+  }
+  window.addEventListener("message", function(event) {
     if (event.source !== window.parent || allowedParentOrigins.indexOf(event.origin) === -1) return;
     var data = event.data;
     if (!data || data.version !== "1.0") return;
-    if (data.type === "study3_init" && typeof data.sessionToken === "string" && /^[a-f0-9]{32}$/.test(data.sessionToken)) {
-      if (["no_information","anonymous_information","named_information"].indexOf(data.condition) === -1 ||
-          !Number.isInteger(data.orderId) || data.orderId < 1 || data.orderId > 10 ||
-          !Array.isArray(data.trialOrder) || data.trialOrder.length !== 10 ||
-          new Set(data.trialOrder).size !== 10 ||
-          !data.trialOrder.every(function(id){ return /^S3_(0[1-9]|10)$/.test(id); }) ||
-          data.probabilitySumRule !== "sum100" || data.showOdds !== true) return;
-      // Repeated init messages are idempotent; never restart a running task.
-      if (config) return;
-      config = data; parentOrigin = event.origin; apply();
-    }
-    if (data.type === "study3_saved" && config && data.sessionToken === config.sessionToken && engine && appliedToken === config.sessionToken) {
-      engine.SendMessage(target,"OnQualtricsAccepted","1");
+    if (data.type === "study3_init") {
+      if (config || !valid(data)) return;
+      config = JSON.parse(JSON.stringify(data)); parentOrigin = event.origin; apply();
+    } else if (data.type === "study3_saved" && accepted && completionSent && !saved
+               && data.sessionToken === config.sessionToken) {
+      saved = true;
+      engine.SendMessage(target, "OnQualtricsAccepted", "1");
     }
   });
   window.Study3Bridge = {
-    attach:function (unityInstance,gameObjectName,receiveMethodName) {
-      if (!unityInstance || !gameObjectName || !receiveMethodName) throw new Error("Supply the real Unity instance, GameObject and config method.");
-      engine=unityInstance;target=gameObjectName;method=receiveMethodName;apply();
+    attach: function(unityInstance) {
+      if (!unityInstance || typeof unityInstance.SendMessage !== "function") throw new Error("Supply the real Unity instance.");
+      if (engine && engine !== unityInstance) throw new Error("Unity instance is already attached.");
+      engine = unityInstance; apply();
     },
-    complete:function (trials) {
-      if (!config || !parentOrigin || appliedToken !== config.sessionToken || !Array.isArray(trials) || trials.length !== 10) throw new Error("Study 3 initialization and ten records are required.");
-      window.parent.postMessage({type:"study3_complete",version:"1.0",sessionToken:config.sessionToken,condition:config.condition,orderId:config.orderId,trials:trials},parentOrigin);
+    registerReceiver: function(gameObjectName, receiveMethodName) {
+      if (!gameObjectName || !receiveMethodName) throw new Error("Unity must register its actual receiver.");
+      if (target && (target !== gameObjectName || method !== receiveMethodName)) throw new Error("Study 3 receiver cannot change.");
+      target = gameObjectName; method = receiveMethodName; apply();
+    },
+    assignmentResult: function(sessionToken, ok, error) {
+      if (!config || deliveredToken !== sessionToken || config.sessionToken !== sessionToken || accepted) return;
+      if (ok === true) {
+        accepted = true;
+        send({type:"study3_ready",version:"1.0",sessionToken:sessionToken});
+      } else {
+        console.error("[Study3] Unity rejected assignment: " + String(error || "Unknown configuration error").slice(0,200));
+        send({type:"study3_error",version:"1.0",sessionToken:sessionToken,error:"assignment_rejected"});
+      }
+    },
+    complete: function(trials) {
+      if (!accepted || !Array.isArray(trials) || trials.length !== 10) throw new Error("Unity must accept the assignment and supply ten trial records.");
+      completionSent = true;
+      send({type:"study3_complete",version:"1.0",sessionToken:config.sessionToken,condition:config.condition,orderId:config.orderId,trials:trials});
     }
   };
 }());
